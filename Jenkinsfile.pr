@@ -2,11 +2,7 @@ pipeline {
   agent any
   options {
     timestamps()
-    timeout(time: 15, unit: 'MINUTES')
-  }
-  environment {
-    IMAGE = "devops-app:pr-${env.CHANGE_ID}-${env.BUILD_NUMBER}"
-    CONTAINER = "devops-app-pr-${env.BUILD_NUMBER}"
+    timeout(time: 20, unit: 'MINUTES')
   }
   stages {
     stage('Checkout') {
@@ -24,40 +20,77 @@ pipeline {
         '''
       }
     }
-    stage('Build') {
-      steps {
-        sh '''
-          if docker build -t $IMAGE . > artifacts/build.log 2>&1; then
-            cat artifacts/build.log
-          else
-            cat artifacts/build.log
-            exit 1
-          fi
-        '''
-      }
-    }
-    stage('Run (Docker)') {
-      steps {
-        sh '''
-          docker run -d --name $CONTAINER $IMAGE
-          IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $CONTAINER)
-          echo "Container IP: $IP"
-          for i in $(seq 1 20); do
-            curl -s -o /dev/null http://$IP:5000/health && break
-            sleep 1
-          done
-        '''
-      }
-    }
-    stage('Smoke Test') {
-      steps {
-        sh '''
-          IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $CONTAINER)
-          ./smoke_test.sh http://$IP:5000 > artifacts/smoke_result.txt 2>&1
-          RC=$?
-          cat artifacts/smoke_result.txt
-          exit $RC
-        '''
+    stage('Parallel builds by Python version') {
+      matrix {
+        axes {
+          axis {
+            name 'PYTHON_VERSION'
+            values '3.11', '3.12'
+          }
+        }
+        stages {
+          stage('Build') {
+            steps {
+              sh '''
+                IMAGE="devops-app:pr-${CHANGE_ID}-${BUILD_NUMBER}-py${PYTHON_VERSION}"
+                mkdir -p artifacts/py${PYTHON_VERSION}
+                if docker build --build-arg PYTHON_VERSION=${PYTHON_VERSION} -t $IMAGE . > artifacts/py${PYTHON_VERSION}/build.log 2>&1; then
+                  cat artifacts/py${PYTHON_VERSION}/build.log
+                else
+                  cat artifacts/py${PYTHON_VERSION}/build.log
+                  exit 1
+                fi
+              '''
+            }
+          }
+          stage('Run (Docker)') {
+            steps {
+              sh '''
+                IMAGE="devops-app:pr-${CHANGE_ID}-${BUILD_NUMBER}-py${PYTHON_VERSION}"
+                CONTAINER="devops-app-pr-${BUILD_NUMBER}-py${PYTHON_VERSION}"
+                docker run -d --name $CONTAINER $IMAGE
+                IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $CONTAINER)
+                echo "Container IP: $IP"
+                for i in $(seq 1 20); do
+                  curl -s -o /dev/null http://$IP:5000/health && break
+                  sleep 1
+                done
+              '''
+            }
+          }
+          stage('Smoke Test') {
+            steps {
+              sh '''
+                CONTAINER="devops-app-pr-${BUILD_NUMBER}-py${PYTHON_VERSION}"
+                IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $CONTAINER)
+                OUT=artifacts/py${PYTHON_VERSION}/smoke_result.txt
+                ./smoke_test.sh http://$IP:5000 > $OUT 2>&1
+                RC=$?
+                if [ $RC -eq 0 ]; then
+                  if curl -s http://$IP:5000/health | grep -q "${PYTHON_VERSION}"; then
+                    echo "VERSION CHECK: PASSED (Python ${PYTHON_VERSION})" >> $OUT
+                  else
+                    echo "VERSION CHECK: FAILED (expected Python ${PYTHON_VERSION})" >> $OUT
+                    RC=1
+                  fi
+                fi
+                cat $OUT
+                exit $RC
+              '''
+            }
+          }
+        }
+        post {
+          always {
+            sh '''
+              IMAGE="devops-app:pr-${CHANGE_ID}-${BUILD_NUMBER}-py${PYTHON_VERSION}"
+              CONTAINER="devops-app-pr-${BUILD_NUMBER}-py${PYTHON_VERSION}"
+              docker logs $CONTAINER > artifacts/py${PYTHON_VERSION}/container.log 2>&1 || true
+              docker rm -f $CONTAINER || true
+              docker rmi -f $IMAGE || true
+            '''
+          }
+        }
       }
     }
     stage('Archive Artifacts') {
@@ -68,13 +101,8 @@ pipeline {
   }
   post {
     always {
-      writeFile file: 'artifacts/pipeline_report.txt', text: "Job: ${env.JOB_NAME}\nBuild: #${env.BUILD_NUMBER}\nPR: ${env.CHANGE_ID}\nResult: ${currentBuild.currentResult}\nImage: ${env.IMAGE}\n"
-      sh 'docker logs $CONTAINER > artifacts/container.log 2>&1 || true'
+      writeFile file: 'artifacts/pipeline_report.txt', text: "Job: ${env.JOB_NAME}\nBuild: #${env.BUILD_NUMBER}\nPR: ${env.CHANGE_ID}\nResult: ${currentBuild.currentResult}\nPython versions: 3.11, 3.12\n"
       archiveArtifacts artifacts: 'artifacts/**', allowEmptyArchive: true
-      sh '''
-        docker rm -f $CONTAINER || true
-        docker rmi -f $IMAGE || true
-      '''
     }
   }
 }
